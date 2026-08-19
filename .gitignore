@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.env
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (generated at runtime)
+data/*.json
+data/*.txt
+*.log
+
+# Test outputs
+ticker_test.png
+ticker_v9_test.png
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Coverage
+htmlcov/
+.coverage
+.pytest_cache/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json

@@ -1,0 +1,33 @@
+# Railway Configuration for Capital Expert Bot
+# This file tells Railway how to build and deploy the application
+
+[build]
+# Use Dockerfile for build
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Health check endpoint
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+# Resource limits (adjust based on your plan)
+# [resources]
+# cpu = 500          # 0.5 vCPU
+# memory = 512       # 512 MB
+
+[[services]]
+name = "bot"
+# The bot runs as a web service with webhook
+# Railway will set PORT environment variable automatically
+
+[services.bot]
+# No additional config needed - uses the Dockerfile CMD
+
+# Optional: Separate worker service for background tasks (if needed)
+# [[services]]
+# name = "worker"
+# [services.worker]
+# startCommand = "python -m bot.worker"
