@@ -4,12 +4,31 @@ Uses pydantic-settings for type-safe environment variable loading.
 """
 from __future__ import annotations
 import os
+import json
 from pathlib import Path
 from typing import List, Optional
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _parse_csv_ints(v: str | List[int]) -> List[int]:
+    """Parse comma-separated integers from string or return list as-is."""
+    if isinstance(v, list):
+        return v
+    if not v:
+        return []
+    return [int(x.strip()) for x in v.split(",") if x.strip().isdigit()]
+
+
+def _parse_csv_str(v: str | List[str]) -> List[str]:
+    """Parse comma-separated strings from string or return list as-is."""
+    if isinstance(v, list):
+        return v
+    if not v:
+        return []
+    return [x.strip() for x in v.split(",") if x.strip()]
 
 
 class Settings(BaseSettings):
@@ -22,22 +41,23 @@ class Settings(BaseSettings):
 
     # Telegram Bot
     bot_token: str = Field(..., description="Telegram Bot Token from @BotFather")
-    admin_ids: List[int] = Field(default_factory=list, description="Comma-separated admin user IDs")
+    admin_ids_raw: str = Field(default="", description="Comma-separated admin user IDs", alias="ADMIN_IDS")
     channel_handle: str = Field(default="@CapXpert", description="Channel username with @")
     channel_name: str = Field(default="کپیتال اکسپرت", description="Channel display name")
     channel_id: Optional[int] = Field(default=None, description="Channel numeric ID (e.g. -100...)")
 
     # Proxy (all optional for Railway - can run without proxy if not in Iran)
     proxy: Optional[str] = Field(default=None, description="Primary proxy URL (socks5:// or http://)")
-    proxy_fallbacks: List[str] = Field(default_factory=list, description="Comma-separated fallback proxies")
+    proxy_fallbacks_raw: str = Field(default="", description="Comma-separated fallback proxies", alias="PROXY_FALLBACKS")
     auto_detect_proxy: bool = Field(default=True, description="Auto-detect common local proxy ports")
     try_direct_fetch: bool = Field(default=True, description="Try fetching without proxy as fallback")
 
     # Price Sources Priority (higher = more trusted)
     # Sources: "do_l4", "yahoo", "tgju", "tsetmc", "coingecko", "coinmarketcap"
-    price_source_priority: List[str] = Field(
-        default_factory=lambda: ["tgju", "do_l4", "yahoo", "coingecko", "tsetmc"],
-        description="Ordered list of price sources by reliability"
+    price_source_priority_raw: str = Field(
+        default="tgju,do_l4,yahoo,coingecko,tsetmc",
+        description="Ordered list of price sources by reliability",
+        alias="PRICE_SOURCE_PRIORITY"
     )
 
     # API Keys for additional sources
@@ -56,7 +76,7 @@ class Settings(BaseSettings):
     glass_buttons: str = Field(default="", description="Format: name1|url1,name2|url2")
 
     # Auto-post schedule
-    auto_post_times: List[str] = Field(default_factory=list, description="HH:MM format, comma-separated")
+    auto_post_times_raw: str = Field(default="", description="HH:MM format, comma-separated", alias="AUTO_POST_TIMES")
 
     # Railway / Deployment
     railway_environment: Optional[str] = Field(default=None, description="Railway environment name")
@@ -76,6 +96,23 @@ class Settings(BaseSettings):
 
     # Default caption
     default_caption: str = "📊 تابلوی قیمتی لحظه‌ای\n🏅 {channel_handle}"
+
+    # Parsed properties
+    @property
+    def admin_ids(self) -> List[int]:
+        return _parse_csv_ints(self.admin_ids_raw)
+
+    @property
+    def proxy_fallbacks(self) -> List[str]:
+        return _parse_csv_str(self.proxy_fallbacks_raw)
+
+    @property
+    def price_source_priority(self) -> List[str]:
+        return _parse_csv_str(self.price_source_priority_raw)
+
+    @property
+    def auto_post_times(self) -> List[str]:
+        return _parse_csv_str(self.auto_post_times_raw)
 
     @property
     def proxy_variants(self) -> List[Optional[dict]]:
@@ -128,6 +165,95 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Cached settings instance."""
     return Settings()
+
+
+# ─── Helper functions for backward compatibility ─────────────────────────
+def load_admins() -> list[int]:
+    settings = get_settings()
+    admins = set(settings.admin_ids)
+    if settings.admins_file.exists():
+        try:
+            extra = json.loads(settings.admins_file.read_text(encoding="utf-8"))
+            admins.update(extra)
+        except:
+            pass
+    return sorted(admins)
+
+
+def save_admins(admins: list[int]):
+    settings = get_settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    extra = [a for a in admins if a not in settings.admin_ids]
+    settings.admins_file.write_text(json.dumps(extra, indent=2), encoding="utf-8")
+
+
+def add_admin(uid: int) -> bool:
+    admins = load_admins()
+    if uid in admins:
+        return False
+    admins.append(uid)
+    save_admins(admins)
+    return True
+
+
+def remove_admin(uid: int) -> bool:
+    settings = get_settings()
+    if uid in settings.admin_ids:
+        return False
+    admins = load_admins()
+    if uid not in admins:
+        return False
+    admins.remove(uid)
+    save_admins(admins)
+    return True
+
+
+def load_caption() -> str:
+    settings = get_settings()
+    try:
+        if settings.caption_file.exists():
+            return settings.caption_file.read_text(encoding="utf-8").strip()
+    except:
+        pass
+    return settings.default_caption.format(channel_handle=settings.channel_handle)
+
+
+def save_caption(text: str):
+    settings = get_settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.caption_file.write_text(text, encoding="utf-8")
+
+
+def load_schedule() -> list[str]:
+    settings = get_settings()
+    if settings.schedule_file.exists():
+        try:
+            return json.loads(settings.schedule_file.read_text(encoding="utf-8"))
+        except:
+            pass
+    return []
+
+
+def save_schedule(times: list[str]):
+    settings = get_settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    settings.schedule_file.write_text(json.dumps(times, indent=2), encoding="utf-8")
+
+
+def glass_buttons_parsed() -> List[tuple[str, str]]:
+    """Module-level function for backward compatibility."""
+    return get_settings().glass_buttons_parsed()
+
+
+def fetch_proxies() -> dict | None:
+    settings = get_settings()
+    if not settings.proxy:
+        return None
+    return {"http": settings.proxy, "https": settings.proxy}
+
+
+def all_proxy_variants() -> List[Optional[dict]]:
+    return get_settings().proxy_variants
 
 
 # Backward compatibility - expose as module-level constants
