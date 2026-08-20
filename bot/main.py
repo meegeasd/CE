@@ -497,8 +497,10 @@ async def catch_all(message: Message):
                 await message.answer("❌ فرمت اشتباه. مثال: <code>09:00,21:00</code>", reply_markup=main_kb())
         return
 
+    from config.version import __version__
     await message.answer(
-        "برای دریافت تابلوی قیمتی، دکمه «📊 تابلو قیمتی» را بزنید.",
+        f"برای دریافت تابلوی قیمتی، دکمه «📊 تابلو قیمتی» را بزنید.\n"
+        f"<i>v{__version__}</i>",
         reply_markup=main_kb(),
     )
 
@@ -649,6 +651,10 @@ async def start_bot():
     auto_task = asyncio.create_task(auto_post_scheduler())
     price_task = asyncio.create_task(price_fetch_scheduler())
 
+    # Delete webhook with drop_pending_updates to prevent ConflictError
+    await bot.delete_webhook(drop_pending_updates=True)
+    await asyncio.sleep(1)  # Give Telegram time to process
+
     if settings.webhook_url:
         # Webhook mode for Railway
         log.info(f"Starting webhook on {settings.webhook_url}")
@@ -661,7 +667,6 @@ async def start_bot():
     else:
         # Polling mode (development) - still run web server for healthcheck
         log.info("Starting polling...")
-        await bot.delete_webhook(drop_pending_updates=True)
         mode = "polling"
 
     log.info(f"Bot started in {mode} mode")
@@ -672,8 +677,16 @@ async def start_bot():
             # Webhook mode - just wait
             await asyncio.Event().wait()
         else:
-            # Polling mode - run polling
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            # Polling mode - run polling with conflict handling
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                handle_signals=False,
+            )
+    except Exception as e:
+        if "Conflict" in str(e):
+            log.error(f"Telegram Conflict: {e}. Another instance may be running.")
+        raise
     finally:
         auto_task.cancel()
         price_task.cancel()
@@ -682,6 +695,7 @@ async def start_bot():
 
 # ─── Entry point ────────────────────────────────────────────────────────
 async def main():
+    from config.version import __version__, __build_date__
     settings = cfg.get_settings()
 
     logging.basicConfig(
@@ -691,7 +705,8 @@ async def main():
     )
 
     log.info("=" * 50)
-    log.info(f"=== {cfg.CHANNEL_NAME} Bot ===")
+    log.info(f"=== {cfg.CHANNEL_NAME} Bot v{__version__} ===")
+    log.info(f"Build: {__build_date__}")
     log.info("=" * 50)
     log.info(f"Channel: {cfg.CHANNEL_HANDLE} ({cfg.CHANNEL_ID or 'not set'})")
     log.info(f"Admins: {cfg.load_admins()}")

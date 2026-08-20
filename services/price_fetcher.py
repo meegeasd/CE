@@ -24,7 +24,7 @@ from config.settings import get_settings
 
 logger = logging.getLogger("price_fetcher")
 
-_EXECUTOR = ThreadPoolExecutor(max_workers=6)
+_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 _CACHE = {"data": None, "ts": 0.0, "ttl": 300}  # 5 min cache
 
 # Rate limiting for CoinGecko
@@ -288,7 +288,7 @@ async def _fetch_do_l4_all(proxy_variants: List[Optional[dict]]) -> Dict[str, Pr
 
 
 async def _fetch_yahoo_all(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Fetch ALL Yahoo symbols in one batch."""
+    """Fetch ALL Yahoo symbols in one batch - optimized parallel."""
     out = {}
 
     for proxies in proxy_variants:
@@ -296,27 +296,45 @@ async def _fetch_yahoo_all(proxy_variants: List[Optional[dict]]) -> Dict[str, Pr
         logger.info(f"Yahoo: trying {proxy_label}...")
         partial_out = {}
 
-        # Fetch all tickers in parallel
-        tasks = []
+        # Fetch all tickers in parallel with timeout
+        tasks = {}
         for code, ticker in YAHOO_TICKERS.items():
             if code in out:
                 continue
-            tasks.append(_fetch_yahoo_single(ticker, proxies))
+            tasks[code] = asyncio.create_task(_fetch_yahoo_single(ticker, proxies))
 
         if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for (code, _), result in zip([(k, v) for k, v in YAHOO_TICKERS.items() if k not in out], results):
-                if isinstance(result, Exception) or result is None:
-                    continue
-                meta = _get_meta(code)
-                partial_out[code] = PriceData(
-                    price=result["price"],
-                    unit="$",
-                    name_fa=meta[1] if meta else code,
-                    name_en=meta[2] if meta else code,
-                    change_pct=result["change_pct"],
-                    source=PriceSource.YAHOO,
+            # Wait for all with overall timeout
+            try:
+                done, pending = await asyncio.wait(
+                    tasks.values(), timeout=20, return_when=asyncio.ALL_COMPLETED
                 )
+                # Cancel any pending
+                for p in pending:
+                    p.cancel()
+
+                # Map results back
+                code_list = list(tasks.keys())
+                for i, task in enumerate(done):
+                    code = code_list[i]
+                    try:
+                        result = task.result()
+                        if result and not isinstance(result, Exception):
+                            meta = _get_meta(code)
+                            partial_out[code] = PriceData(
+                                price=result["price"],
+                                unit="$",
+                                name_fa=meta[1] if meta else code,
+                                name_en=meta[2] if meta else code,
+                                change_pct=result["change_pct"],
+                                source=PriceSource.YAHOO,
+                            )
+                    except Exception:
+                        pass
+            except asyncio.TimeoutError:
+                logger.warning(f"Yahoo: timeout for {proxy_label}")
+                for t in tasks.values():
+                    t.cancel()
 
         if partial_out:
             out.update(partial_out)
@@ -370,8 +388,9 @@ async def _fetch_coingecko_all(proxy_variants: List[Optional[dict]]) -> Dict[str
     # Rate limiting
     now = time.time()
     if now - _COINGECKO_LAST_CALL < _COINGECKO_MIN_INTERVAL:
-        logger.debug(f"CoinGecko: rate limited, waiting {_COINGECKO_MIN_INTERVAL - (now - _COINGECKO_LAST_CALL):.1f}s")
-        await asyncio.sleep(_COINGECKO_MIN_INTERVAL - (now - _COINGECKO_LAST_CALL))
+        wait_time = _COINGECKO_MIN_INTERVAL - (now - _COINGECKO_LAST_CALL)
+        logger.debug(f"CoinGecko: rate limited, waiting {wait_time:.1f}s")
+        await asyncio.sleep(wait_time)
 
     cg_symbols = {k: v for k, v in COINGECKO_IDS.items() if k in ["BTC", "ETH", "SOL", "USDT", "XAU", "XAG"]}
     ids = ",".join(cg_symbols.values())
@@ -471,7 +490,7 @@ async def fetch_all_prices() -> Dict[str, Any]:
         except ValueError:
             logger.warning(f"Unknown price source: {src_name}")
 
-    # ─── Step 1: Fetch ALL sources in parallel ───
+    # ─── Step 1: Fetch ALL sources in parallel (ONE call per source) ───
     logger.info("Fetching all sources in parallel...")
     fetch_tasks = {}
     for src in priority_sources:
@@ -479,19 +498,35 @@ async def fetch_all_prices() -> Dict[str, Any]:
         if fetcher:
             fetch_tasks[src] = asyncio.create_task(fetcher(proxy_variants))
 
-    # Wait for all sources
+    # Wait for all sources with overall timeout
     source_results = {}
-    for src, task in fetch_tasks.items():
+    if fetch_tasks:
         try:
-            result = await asyncio.wait_for(task, timeout=30)
-            source_results[src] = result
-            logger.info(f"{src.value}: got {len(result)} symbols")
+            done, pending = await asyncio.wait(
+                fetch_tasks.values(), timeout=35, return_when=asyncio.ALL_COMPLETED
+            )
+            for p in pending:
+                p.cancel()
+                try:
+                    await p
+                except asyncio.CancelledError:
+                    pass
+
+            # Map results
+            src_list = list(fetch_tasks.keys())
+            for i, task in enumerate(done):
+                src = src_list[i]
+                try:
+                    result = task.result()
+                    source_results[src] = result if result else {}
+                    logger.info(f"{src.value}: got {len(source_results[src])} symbols")
+                except Exception as e:
+                    logger.warning(f"{src.value}: failed: {e}")
+                    source_results[src] = {}
         except asyncio.TimeoutError:
-            logger.warning(f"{src.value}: timeout after 30s")
-            source_results[src] = {}
-        except Exception as e:
-            logger.warning(f"{src.value}: failed: {e}")
-            source_results[src] = {}
+            logger.warning("Overall fetch timeout after 35s")
+            for t in fetch_tasks.values():
+                t.cancel()
 
     # ─── Step 2: Merge with priority ───
     final_prices: Dict[str, PriceData] = {}

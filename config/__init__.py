@@ -2,6 +2,7 @@
 Config module — Configuration management for Capital Expert Bot.
 """
 from .settings import get_settings, Settings
+from .version import __version__, __build_date__
 
 # Backward compatibility
 _settings = get_settings()
@@ -49,4 +50,5 @@ __all__ = [
     "load_caption", "save_caption",
     "load_schedule", "save_schedule",
     "glass_buttons_parsed", "fetch_proxies", "all_proxy_variants",
+    "__version__", "__build_date__",
 ]
