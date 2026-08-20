@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     )
 
     # Telegram Bot
-    bot_token: str = Field(..., description="Telegram Bot Token from @BotFather")
+    bot_token: str = Field(default="", description="Telegram Bot Token from @BotFather")
     admin_ids_raw: str = Field(default="", description="Comma-separated admin user IDs", alias="ADMIN_IDS")
     channel_handle: str = Field(default="@CapXpert", description="Channel username with @")
     channel_name: str = Field(default="کپیتال اکسپرت", description="Channel display name")

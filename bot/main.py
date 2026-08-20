@@ -603,20 +603,54 @@ async def start_bot():
 
     settings = cfg.get_settings()
 
-    # Create bot
-    bot = await create_bot()
-
-    # Start background tasks
-    auto_task = asyncio.create_task(auto_post_scheduler())
-    price_task = asyncio.create_task(price_fetch_scheduler())
-
-    # Create web app (ALWAYS for healthcheck)
+    # Create web app (ALWAYS for healthcheck) - start BEFORE bot to pass healthcheck
     app = web.Application()
 
     # Health check endpoint (always available)
     async def health(request):
-        return web.json_response({"status": "ok", "bot": "running", "mode": "webhook" if settings.webhook_url else "polling"})
+        return web.json_response({
+            "status": "ok",
+            "bot": "running" if bot else "not_configured",
+            "mode": "webhook" if settings.webhook_url else "polling" if settings.bot_token else "standby",
+            "token_set": bool(settings.bot_token),
+        })
     app.router.add_get("/health", health)
+
+    # Start web server FIRST (so healthcheck passes even if bot fails)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", settings.port)
+    await site.start()
+    log.info(f"Web server started on port {settings.port}")
+
+    # Check if bot token is configured
+    if not settings.bot_token:
+        log.error("❌ BOT_TOKEN not set! Bot will run in standby mode.")
+        log.error("   Add BOT_TOKEN environment variable in Railway → Variables")
+        log.error("   Healthcheck will pass, but bot features won't work until token is set.")
+        # Keep web server running for healthcheck
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
+        return
+
+    # Create bot (now that token is verified to exist)
+    try:
+        bot = await create_bot()
+    except Exception as e:
+        log.error(f"❌ Failed to connect bot: {e}")
+        log.error("   Bot will run in standby mode. Fix config and redeploy.")
+        # Keep web server running for healthcheck
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
+        return
+
+    # Start background tasks (only if bot connected)
+    auto_task = asyncio.create_task(auto_post_scheduler())
+    price_task = asyncio.create_task(price_fetch_scheduler())
 
     if settings.webhook_url:
         # Webhook mode for Railway
@@ -633,12 +667,7 @@ async def start_bot():
         await bot.delete_webhook(drop_pending_updates=True)
         mode = "polling"
 
-    # Start web server (ALWAYS)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", settings.port)
-    await site.start()
-    log.info(f"Web server started on port {settings.port} ({mode} mode)")
+    log.info(f"Bot started in {mode} mode")
 
     # Keep running
     try:
