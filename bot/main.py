@@ -83,11 +83,10 @@ def glass_kb(include_send: bool = False, callback_id: str | None = None) -> Inli
         row = [InlineKeyboardButton(text=n, url=u) for n, u in btns[i:i+2]]
         rows.append(row)
     if include_send and callback_id:
-        # Green (positive) button for send-to-channel
+        # Send to channel button (no style parameter - not supported in aiogram 3.x)
         rows.append([InlineKeyboardButton(
             text=f"📤 ارسال به کانال",
             callback_data=f"send:{callback_id}",
-            style="positive",  # Telegram colored button feature
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -104,8 +103,8 @@ def news_approval_kb(news_hash: str) -> InlineKeyboardMarkup:
     """Keyboard for news approval — green approve, red reject."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ ارسال به کانال", callback_data=f"news:approve:{news_hash}", style="positive"),
-            InlineKeyboardButton(text="❌ رد", callback_data=f"news:reject:{news_hash}", style="destructive"),
+            InlineKeyboardButton(text="✅ ارسال به کانال", callback_data=f"news:approve:{news_hash}"),
+            InlineKeyboardButton(text="❌ رد", callback_data=f"news:reject:{news_hash}"),
         ],
     ])
 
@@ -113,10 +112,9 @@ def news_approval_kb(news_hash: str) -> InlineKeyboardMarkup:
 async def send_ticker_to_pm(chat_id: int, reply_to: int | None = None) -> bool:
     if not bot:
         return False
-    loop = asyncio.get_running_loop()
     t0 = time.time()
     try:
-        result = await loop.run_in_executor(None, lambda: asyncio.run(fetch_all_prices()))
+        result = await fetch_all_prices()
         prices = result["prices"]
         log.info(f"Fetched {len(prices)} prices in {time.time()-t0:.1f}s")
     except Exception as e:
@@ -129,7 +127,7 @@ async def send_ticker_to_pm(chat_id: int, reply_to: int | None = None) -> bool:
     out = tmp / f"ticker_{cb_id}.png"
     async with _render_lock:
         try:
-            await loop.run_in_executor(None, lambda: render_ticker(prices, str(out), handle=cfg.CHANNEL_HANDLE))
+            await asyncio.get_running_loop().run_in_executor(None, lambda: render_ticker(prices, str(out), handle=cfg.CHANNEL_HANDLE))
         except Exception as e:
             log.error(f"Render failed: {e}")
             await _safe_msg(chat_id, "❌ خطا در ساخت تصویر.", reply_to)
@@ -164,9 +162,8 @@ async def post_ticker_to_channel() -> bool:
     """Post ticker to channel WITH glass buttons + caption."""
     if not bot or not cfg.CHANNEL_ID:
         return False
-    loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(None, lambda: asyncio.run(fetch_all_prices()))
+        result = await fetch_all_prices()
         prices = result["prices"]
     except Exception as e:
         log.error(f"Price fetch failed for channel post: {e}")
@@ -176,7 +173,7 @@ async def post_ticker_to_channel() -> bool:
     out = tmp / f"channel_{int(time.time())}.png"
     async with _render_lock:
         try:
-            await loop.run_in_executor(None, lambda: render_ticker(prices, str(out), handle=cfg.CHANNEL_HANDLE))
+            await asyncio.get_running_loop().run_in_executor(None, lambda: render_ticker(prices, str(out), handle=cfg.CHANNEL_HANDLE))
         except Exception as e:
             log.error(f"Render failed: {e}")
             return False

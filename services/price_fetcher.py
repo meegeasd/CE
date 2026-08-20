@@ -1,18 +1,11 @@
 """
 Price Fetcher — Multi-source with priority-based selection for Railway deployment.
 
-Sources (in priority order):
-1. TGJU (tgju.org) - Most reliable for IR prices (USD, Gold, Crypto)
-2. DO_L4 (Telegram channel) - Good fallback for IR prices
-3. Yahoo Finance - International symbols (XAU, Oil, Indices, Stocks)
-4. CoinGecko - Crypto prices (global, reliable)
-5. TSETMC - Iranian stock market (if API available)
-
-Strategy:
-- Try each source in priority order
-- For each symbol, use the first source that returns a valid price
-- Cache results for 5 minutes
-- Run every 6 hours via scheduler
+Architecture:
+- Fetch ALL sources ONCE per cycle (parallel)
+- Merge results with priority-based conflict resolution
+- Cache for 5 minutes
+- Proper rate limiting and error handling
 """
 from __future__ import annotations
 import re
@@ -33,6 +26,10 @@ logger = logging.getLogger("price_fetcher")
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=6)
 _CACHE = {"data": None, "ts": 0.0, "ttl": 300}  # 5 min cache
+
+# Rate limiting for CoinGecko
+_COINGECKO_LAST_CALL = 0.0
+_COINGECKO_MIN_INTERVAL = 60.0  # 1 call per minute max
 
 
 class PriceSource(str, Enum):
@@ -148,9 +145,10 @@ def _get_meta(code: str) -> tuple:
     return ()
 
 
-# ─── TGJU Fetcher ────────────────────────────────────────────────────────────
-async def _fetch_tgju(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Fetch prices from TGJU (tgju.org) - most reliable for Iranian market."""
+# ─── Source Fetchers (each fetches ALL symbols it supports in ONE call) ─────────
+
+async def _fetch_tgju_all(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
+    """Fetch ALL TGJU symbols in one request."""
     settings = get_settings()
     if not settings.tgju_api_key:
         logger.debug("TGJU API key not configured, skipping")
@@ -172,8 +170,6 @@ async def _fetch_tgju(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceDa
             data = r.json()
 
             for code, tgju_key in TGJU_SYMBOLS.items():
-                if code in out:
-                    continue
                 indicator = data.get("data", {}).get(tgju_key)
                 if indicator and "price" in indicator:
                     price = _to_float(str(indicator["price"]))
@@ -200,9 +196,8 @@ async def _fetch_tgju(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceDa
     return out
 
 
-# ─── DO_L4 Fetcher ───────────────────────────────────────────────────────────
-async def _fetch_do_l4(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Fetch prices from DO_L4 Telegram channel."""
+async def _fetch_do_l4_all(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
+    """Fetch ALL DO_L4 symbols in one request."""
     out = {}
 
     for proxies in proxy_variants:
@@ -292,9 +287,8 @@ async def _fetch_do_l4(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceD
     return out
 
 
-# ─── Yahoo Finance Fetcher ───────────────────────────────────────────────────
-async def _fetch_yahoo(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Fetch prices from Yahoo Finance."""
+async def _fetch_yahoo_all(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
+    """Fetch ALL Yahoo symbols in one batch."""
     out = {}
 
     for proxies in proxy_variants:
@@ -302,21 +296,25 @@ async def _fetch_yahoo(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceD
         logger.info(f"Yahoo: trying {proxy_label}...")
         partial_out = {}
 
+        # Fetch all tickers in parallel
+        tasks = []
         for code, ticker in YAHOO_TICKERS.items():
-            if code in out or code in partial_out:
+            if code in out:
                 continue
-            if partial_out:
-                await asyncio.sleep(0.3)
+            tasks.append(_fetch_yahoo_single(ticker, proxies))
 
-            entry = await _fetch_yahoo_single(ticker, proxies)
-            if entry:
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for (code, _), result in zip([(k, v) for k, v in YAHOO_TICKERS.items() if k not in out], results):
+                if isinstance(result, Exception) or result is None:
+                    continue
                 meta = _get_meta(code)
                 partial_out[code] = PriceData(
-                    price=entry["price"],
+                    price=result["price"],
                     unit="$",
                     name_fa=meta[1] if meta else code,
                     name_en=meta[2] if meta else code,
-                    change_pct=entry["change_pct"],
+                    change_pct=result["change_pct"],
                     source=PriceSource.YAHOO,
                 )
 
@@ -363,13 +361,18 @@ async def _fetch_yahoo_single(ticker: str, proxies: Optional[dict]) -> Optional[
     return None
 
 
-# ─── CoinGecko Fetcher ───────────────────────────────────────────────────────
-async def _fetch_coingecko(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Fetch crypto prices from CoinGecko (free tier, no API key needed for basic)."""
+async def _fetch_coingecko_all(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
+    """Fetch ALL CoinGecko symbols in one request with rate limiting."""
+    global _COINGECKO_LAST_CALL
     settings = get_settings()
     out = {}
 
-    # Only fetch crypto symbols that CoinGecko supports
+    # Rate limiting
+    now = time.time()
+    if now - _COINGECKO_LAST_CALL < _COINGECKO_MIN_INTERVAL:
+        logger.debug(f"CoinGecko: rate limited, waiting {_COINGECKO_MIN_INTERVAL - (now - _COINGECKO_LAST_CALL):.1f}s")
+        await asyncio.sleep(_COINGECKO_MIN_INTERVAL - (now - _COINGECKO_LAST_CALL))
+
     cg_symbols = {k: v for k, v in COINGECKO_IDS.items() if k in ["BTC", "ETH", "SOL", "USDT", "XAU", "XAG"]}
     ids = ",".join(cg_symbols.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
@@ -381,10 +384,16 @@ async def _fetch_coingecko(proxy_variants: List[Optional[dict]]) -> Dict[str, Pr
         try:
             proxy_label = proxies["http"] if proxies else "direct"
             logger.info(f"CoinGecko: trying {proxy_label}...")
+            _COINGECKO_LAST_CALL = time.time()
+
             r = await asyncio.get_event_loop().run_in_executor(
                 _EXECUTOR,
                 lambda: requests.get(url, headers=headers, timeout=10, proxies=proxies)
             )
+            if r.status_code == 429:
+                logger.warning("CoinGecko: rate limited (429)")
+                await asyncio.sleep(5)
+                continue
             r.raise_for_status()
             data = r.json()
 
@@ -417,37 +426,32 @@ async def _fetch_coingecko(proxy_variants: List[Optional[dict]]) -> Dict[str, Pr
     return out
 
 
-# ─── TSETMC Fetcher (placeholder) ───────────────────────────────────────────
-async def _fetch_tsetmc(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Fetch from TSETMC (Tehran Stock Exchange) - placeholder for future."""
+async def _fetch_tsetmc_all(proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
+    """Fetch from TSETMC - placeholder."""
     settings = get_settings()
     if not settings.tsetmc_api_key:
         return {}
-    # Implementation would go here
     return {}
 
 
-# ─── Source Router ───────────────────────────────────────────────────────────
-async def _fetch_from_source(source: PriceSource, proxy_variants: List[Optional[dict]]) -> Dict[str, PriceData]:
-    """Route to appropriate fetcher based on source."""
-    fetchers = {
-        PriceSource.TGJU: _fetch_tgju,
-        PriceSource.DO_L4: _fetch_do_l4,
-        PriceSource.YAHOO: _fetch_yahoo,
-        PriceSource.COINGECKO: _fetch_coingecko,
-        PriceSource.TSETMC: _fetch_tsetmc,
-    }
-    fetcher = fetchers.get(source)
-    if fetcher:
-        return await fetcher(proxy_variants)
-    return {}
+# ─── Source Map ───────────────────────────────────────────────────────────────
+_SOURCE_FETCHERS = {
+    PriceSource.TGJU: _fetch_tgju_all,
+    PriceSource.DO_L4: _fetch_do_l4_all,
+    PriceSource.YAHOO: _fetch_yahoo_all,
+    PriceSource.COINGECKO: _fetch_coingecko_all,
+    PriceSource.TSETMC: _fetch_tsetmc_all,
+}
 
 
 # ─── Main Fetch Function ─────────────────────────────────────────────────────
 async def fetch_all_prices() -> Dict[str, Any]:
     """
     Fetch all prices using priority-based source selection.
-    For each symbol, tries sources in priority order until one succeeds.
+    Strategy:
+    1. Fetch ALL sources in parallel (one call per source)
+    2. For each symbol, pick the highest-priority source that succeeded
+    3. Cache for 5 minutes
     """
     settings = get_settings()
 
@@ -467,19 +471,39 @@ async def fetch_all_prices() -> Dict[str, Any]:
         except ValueError:
             logger.warning(f"Unknown price source: {src_name}")
 
-    # Track which symbols we've successfully fetched
+    # ─── Step 1: Fetch ALL sources in parallel ───
+    logger.info("Fetching all sources in parallel...")
+    fetch_tasks = {}
+    for src in priority_sources:
+        fetcher = _SOURCE_FETCHERS.get(src)
+        if fetcher:
+            fetch_tasks[src] = asyncio.create_task(fetcher(proxy_variants))
+
+    # Wait for all sources
+    source_results = {}
+    for src, task in fetch_tasks.items():
+        try:
+            result = await asyncio.wait_for(task, timeout=30)
+            source_results[src] = result
+            logger.info(f"{src.value}: got {len(result)} symbols")
+        except asyncio.TimeoutError:
+            logger.warning(f"{src.value}: timeout after 30s")
+            source_results[src] = {}
+        except Exception as e:
+            logger.warning(f"{src.value}: failed: {e}")
+            source_results[src] = {}
+
+    # ─── Step 2: Merge with priority ───
     final_prices: Dict[str, PriceData] = {}
     source_stats: Dict[str, int] = {}
 
-    # For each symbol, try sources in priority order
     for symbol_meta in SYMBOLS:
         code = symbol_meta[0]
         primary_src = symbol_meta[4]
         fallback_srcs = symbol_meta[5]
 
-        # Build ordered source list for this symbol: primary first, then fallbacks, then global priority
+        # Build ordered source list for this symbol
         symbol_sources = [primary_src] + fallback_srcs
-        # Add remaining global priority sources not already in list
         for src in priority_sources:
             if src not in symbol_sources:
                 symbol_sources.append(src)
@@ -487,23 +511,21 @@ async def fetch_all_prices() -> Dict[str, Any]:
         # Try each source for this symbol
         for src in symbol_sources:
             if code in final_prices:
-                break  # Already got this symbol
-
-            prices = await _fetch_from_source(src, proxy_variants)
-            if code in prices:
-                final_prices[code] = prices[code]
+                break
+            if src in source_results and code in source_results[src]:
+                final_prices[code] = source_results[src][code]
                 source_stats[src.value] = source_stats.get(src.value, 0) + 1
                 logger.debug(f"{code}: got from {src.value}")
                 break
 
-    # Enrich $ prices with toman equivalent
+    # ─── Step 3: Enrich $ prices with toman equivalent ───
     usd_price = final_prices.get("USD", {}).price if "USD" in final_prices else None
     if usd_price and usd_price > 0:
         for code, p in final_prices.items():
             if p.unit == "$" and p.toman_price is None:
                 p.toman_price = p.price * usd_price
 
-    # Convert to serializable format
+    # ─── Step 4: Convert to serializable format ───
     result_prices = {}
     for code, p in final_prices.items():
         result_prices[code] = {
