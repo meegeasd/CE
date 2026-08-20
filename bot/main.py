@@ -598,7 +598,7 @@ async def create_bot() -> Bot:
     raise RuntimeError("Could not connect to Telegram via any proxy")
 
 async def start_bot():
-    """Start the bot (polling or webhook)."""
+    """Start the bot (polling or webhook) with always-on web server for healthcheck."""
     global bot
 
     settings = cfg.get_settings()
@@ -610,44 +610,49 @@ async def start_bot():
     auto_task = asyncio.create_task(auto_post_scheduler())
     price_task = asyncio.create_task(price_fetch_scheduler())
 
+    # Create web app (ALWAYS for healthcheck)
+    app = web.Application()
+
+    # Health check endpoint (always available)
+    async def health(request):
+        return web.json_response({"status": "ok", "bot": "running", "mode": "webhook" if settings.webhook_url else "polling"})
+    app.router.add_get("/health", health)
+
     if settings.webhook_url:
         # Webhook mode for Railway
         log.info(f"Starting webhook on {settings.webhook_url}")
         await bot.set_webhook(settings.webhook_url, drop_pending_updates=True)
 
-        # Create web app
-        app = web.Application()
+        # Register webhook handler
         SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
         setup_application(app, dp, bot=bot)
-
-        # Health check endpoint
-        async def health(request):
-            return web.json_response({"status": "ok", "bot": "running"})
-        app.router.add_get("/health", health)
-
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", settings.port)
-        await site.start()
-        log.info(f"Webhook server started on port {settings.port}")
-
-        # Keep running
-        try:
-            await asyncio.Event().wait()
-        finally:
-            auto_task.cancel()
-            price_task.cancel()
-            await bot.session.close()
+        mode = "webhook"
     else:
-        # Polling mode (development)
+        # Polling mode (development) - still run web server for healthcheck
         log.info("Starting polling...")
         await bot.delete_webhook(drop_pending_updates=True)
-        try:
+        mode = "polling"
+
+    # Start web server (ALWAYS)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", settings.port)
+    await site.start()
+    log.info(f"Web server started on port {settings.port} ({mode} mode)")
+
+    # Keep running
+    try:
+        if settings.webhook_url:
+            # Webhook mode - just wait
+            await asyncio.Event().wait()
+        else:
+            # Polling mode - run polling
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-        finally:
-            auto_task.cancel()
-            price_task.cancel()
-            await bot.session.close()
+    finally:
+        auto_task.cancel()
+        price_task.cancel()
+        await bot.session.close()
+        await runner.cleanup()
 
 # ─── Entry point ────────────────────────────────────────────────────────
 async def main():
